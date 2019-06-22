@@ -1,0 +1,220 @@
+#!/usr/bin/perl
+##
+## `get_schedule' 
+##
+## This script displays the schedule of the streams.
+##
+##
+## Use the `human_readable=1' parameter if you want analyse the output.
+##
+use strict;
+use warnings;
+use v5.10;
+
+# Used for encode hash to JSON
+use JSON qw/encode_json/;
+
+# Load standard `CGI' procedures
+use CGI qw/standard/;
+
+
+
+# Create new `CGI' object
+my $q = CGI->new();
+
+print $q->header('text/plain; charset=utf-8');
+
+
+# All form fields have now been imported 
+# and assigned to the %param hash.
+# To access the 'name' field:
+#
+#  $param{name}
+my %param = $q->Vars;
+
+
+my $json = JSON->new;
+
+# Common hash for schedule storage
+my %json;
+
+
+# If `human_readable=1' parameter is passed,
+# outputs data in pretty format
+if ( defined($param{human_readable}) && $param{human_readable} eq '1' ) {
+    $json->indent->space_after;
+}
+
+
+$json{name} = "Барнаульский филиал ФГОБУ ВО «Финансовый университет при Правительстве Российской Федерации»";
+$json{abbr} = "БФ ФУ";
+
+
+# DB interaction module
+use Lib;
+
+# List of groups
+my $qry = '
+SELECT groups.id, groupname.name 
+FROM groups LEFT JOIN groupname ON groupname.id=groups.groupnameid
+WHERE periodid=(
+ SELECT param FROM settings WHERE description=\'Код активного периода\'
+ ) AND (
+ SELECT MAX(enddate) FROM group_session WHERE groupid=groups.id
+ AND confirmed=\'1\'
+ ) IS NOT NULL
+ORDER BY name
+';
+
+my $sth = $Lib::dbh->prepare($qry);
+$sth->execute
+    or die "Can't execute query\n$qry\n". $Lib::dbh->errstr;
+
+
+
+# Array of groups
+# Contains `groupname' and `lessons'
+my @groups;
+
+my @group_ids;
+my %group_names;
+
+while (my @row = $sth->fetchrow_array) {
+    push @group_ids, $row[0];
+    $group_names{$row[0]} = $row[1];
+}
+
+
+for my $group_id (@group_ids) {
+    # Request lessons for a particular group
+    $qry = "
+SELECT subjid, subject.fullname AS subject, lesstype.name AS type,
+ lesstypeid, pairid, TIME_FORMAT(pair.begtime, '%H:%i') AS time_start,
+ TIME_FORMAT(pair.endtime, '%H:%i') AS time_end, tutorid, 
+ CONCAT_WS(' ', tutor.lastname, tutor.firstname, tutor.secname) 
+  AS teacher_name,
+ roomid, CONCAT_WS('',room.roomnum, r.name) AS auditory_name, 
+ r.address AS auditory_address, 
+ GROUP_CONCAT(DATE_FORMAT(lessdate,'%d.%m.%Y') 
+  ORDER BY lessdate ASC SEPARATOR ', ') AS dates
+FROM lessons LEFT JOIN subject ON lessons.subjid=subject.id 
+ LEFT JOIN lesstype ON lessons.lesstypeid=lesstype.id 
+ LEFT JOIN pair ON lessons.pairid=pair.id 
+ LEFT JOIN tutor ON lessons.tutorid=tutor.id 
+ LEFT JOIN room ON lessons.roomid=room.id 
+ LEFT JOIN (
+  SELECT room.roomnum, room.id, building.name, building.address 
+  FROM room 
+  LEFT JOIN building ON room.buildid=building.id
+ ) AS r ON lessons.roomid=r.id 
+WHERE streamid in (
+ SELECT streamid FROM streamgroup WHERE groupid='".$group_id."' 
+ ) AND
+ periodid=(
+   SELECT param FROM settings 
+   WHERE description=\'Код активного периода\'
+   ) AND
+ lessdate<=(SELECT MAX(enddate) FROM group_session 
+ WHERE groupid='".$group_id."' AND confirmed='1')
+GROUP BY subjid, lesstype.name, pairid, roomid, tutorid
+ORDER BY subjid, pairid;
+";
+    
+    $sth = $Lib::dbh->prepare($qry);
+    $sth->execute
+        or die "Can't execute query\n$qry\n". $Lib::dbh->errstr;
+
+    
+    # Count of lessons
+    my $numrows = $sth->rows;
+
+
+    # Contains data about lessons
+    my @lessons;
+
+
+    # Construct the array of hashes if lessons exists
+    #
+    # NB:
+    # Assigning to link to an array creates array in JSON:
+    if ($numrows) {
+        while (my $row = $sth->fetchrow_hashref) {
+
+            push my @auditories, (
+                    {name => $row->{auditory_name},
+                     addr => $row->{auditory_address}}
+                    ); 
+
+            push my @teachers, (
+                    {name => $row->{teacher_name}} 
+                    );  
+
+            push @lessons, (
+                 {subject   => $row->{subject},
+                  type      => $row->{type},
+                  time      => {start => $row->{time_start},
+                                end   => $row->{time_end}},
+                  date     => $row->{dates},
+                  teachers  => \@teachers,
+                  audiences => \@auditories}
+                  );
+        }
+        push @groups, {name    => $group_names{$group_id},
+                       lessons => \@lessons};
+    }
+}
+
+$sth->finish();
+$Lib::dbh->disconnect();
+
+
+push my @faculties, {name   => "Все факультеты",
+                     groups => \@groups};
+
+$json{faculties} = \@faculties;
+
+my $data = $json->encode(\%json);
+print $data;
+
+
+#
+# POST sending
+#
+use LWP::UserAgent;
+
+# Need to change api "Расписания ВУЗов" url
+my $url = "http://192.168.0.5/cgi-bin/less/endpost.cgi";
+my $format = "json";
+my $report = 'it@example.org';
+my $token = '';
+
+
+# Create user-agent
+my $ua = LWP::UserAgent->new;
+
+my $req = HTTP::Request->new(POST=>$url);
+
+# Set context type
+$req->content_type('application/x-www-form-urlencoded');
+
+# Content for sending
+$req->content("format=$format&data=$data&report=$report&token=$token");
+
+my $res = $ua->request($req);
+
+
+# Get response
+#print "Ответ сервера:\n". $res->content;
+print "Ответ сервера:\n". $res->as_string;
+
+# If you wish to get full repsponse with http headers,
+# call as `print $res->as_string'
+
+
+# Additional subroutines
+sub StrEscaped {
+  # Convert transfered cyrillyc symbols
+  my ($str)=@_;
+  $str=~s/([^0-9A-Za-z\?&=:;])/sprintf("%%%x", ord($1))/eg;
+  return $str
+}
